@@ -314,6 +314,8 @@ func (s *KafkaSensor) Event(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMess
 	}
 
 	messages := []*sarama.ProducerMessage{}
+	var fns []func()
+
 	for _, trigger := range s.triggers.List(event) {
 		event, err := trigger.Transform(trigger.depName, event)
 		if err != nil {
@@ -326,29 +328,33 @@ func (s *KafkaSensor) Event(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMess
 			continue
 		}
 
-		// if the trigger only requires one message to be invoked we
-		// can skip ahead to the action topic, otherwise produce to
-		// the trigger topic
-
-		var data any
-		var topic string
 		if trigger.OneAndDone() {
-			data = []*cloudevents.Event{event}
-			topic = s.topics.action
-		} else {
-			data = event
-			topic = s.topics.trigger
+			// Single-dependency: invoke action directly, skip action topic.
+			// This avoids a full Kafka transaction (BeginTxn + Produce +
+			// AddOffsetsToTxn + CommitTxn) which can add seconds of latency
+			// due to CONCURRENT_TRANSACTIONS retries in sarama.
+			f := trigger.Action([]*cloudevents.Event{event}, trigger.depName)
+			if f != nil {
+				fns = append(fns, f)
+			}
+			continue
 		}
 
-		value, err := json.Marshal(data)
+		// Multi-dependency: route through trigger topic for dependency aggregation
+		value, err := json.Marshal(event)
 		if err != nil {
 			s.Logger.Errorw("Failed to serialize cloudevent, skipping", zap.Error(err))
 			continue
 		}
 
+		// Use source message coordinates as key to route all trigger
+		// messages from the same event to the same partition, reducing
+		// AddPartitionsToTxn calls from N to 1 per transaction.
+		partitionKey := fmt.Sprintf("%s-%d-%d", msg.Topic, msg.Partition, msg.Offset)
+
 		messages = append(messages, &sarama.ProducerMessage{
-			Topic: topic,
-			Key:   sarama.StringEncoder(trigger.Name()),
+			Topic: s.topics.trigger,
+			Key:   sarama.StringEncoder(partitionKey),
 			Value: sarama.ByteEncoder(value),
 			Headers: []sarama.RecordHeader{{
 				Key:   []byte(dependencyNameHeader),
@@ -357,7 +363,17 @@ func (s *KafkaSensor) Event(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMess
 		})
 	}
 
-	return messages, msg.Offset + 1, nil
+	// Compose all direct-action callbacks into a single function
+	var fn func()
+	if len(fns) > 0 {
+		fn = func() {
+			for _, f := range fns {
+				f()
+			}
+		}
+	}
+
+	return messages, msg.Offset + 1, fn
 }
 
 func (s *KafkaSensor) Trigger(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMessage, int64, func()) {
@@ -379,6 +395,9 @@ func (s *KafkaSensor) Trigger(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMe
 			}
 		}
 	}
+
+	var fns []func()
+
 	// update trigger with new event and add any resulting action to
 	// transaction messages
 	if trigger, ok := s.triggers[string(msg.Key)]; ok && event != nil {
@@ -394,21 +413,15 @@ func (s *KafkaSensor) Trigger(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMe
 				return
 			}
 
-			value, err := json.Marshal(events)
-			if err != nil {
-				s.Logger.Errorw("Failed to serialize cloudevent, skipping", zap.Error(err))
-				return
+			// Dependencies satisfied — invoke action directly, skip action topic.
+			// This avoids a full Kafka transaction for the trigger→action hop.
+			// At-least-once is preserved: if the sensor crashes before the trigger
+			// topic offset is committed, the message will be reconsumed and
+			// re-evaluated.
+			f := trigger.Action(events, dependencyName)
+			if f != nil {
+				fns = append(fns, f)
 			}
-
-			messages = append(messages, &sarama.ProducerMessage{
-				Topic: s.topics.action,
-				Key:   sarama.StringEncoder(trigger.Name()),
-				Value: sarama.ByteEncoder(value),
-				Headers: []sarama.RecordHeader{{
-					Key:   []byte(dependencyNameHeader),
-					Value: []byte(dependencyName),
-				}},
-			})
 		}()
 	}
 
@@ -419,7 +432,17 @@ func (s *KafkaSensor) Trigger(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMe
 		offset = trigger.Offset(msg.Partition, offset)
 	}
 
-	return messages, offset, nil
+	// Compose action callbacks
+	var fn func()
+	if len(fns) > 0 {
+		fn = func() {
+			for _, f := range fns {
+				f()
+			}
+		}
+	}
+
+	return messages, offset, fn
 }
 
 func (s *KafkaSensor) Action(msg *sarama.ConsumerMessage) ([]*sarama.ProducerMessage, int64, func()) {
